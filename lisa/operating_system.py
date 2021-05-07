@@ -2,12 +2,15 @@
 # Licensed under the MIT license.
 
 import re
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Pattern, Type, Union
 
+from lisa.base_tools.wget import Wget
 from lisa.executable import Tool
 from lisa.util import BaseClassMixin, LisaException, get_matched_str
 from lisa.util.logger import get_logger
+from lisa.util.process import ExecutableResult
 from lisa.util.subclasses import Factory
 
 if TYPE_CHECKING:
@@ -15,6 +18,23 @@ if TYPE_CHECKING:
 
 
 _get_init_logger = partial(get_logger, name="os")
+
+
+@dataclass
+class OsVersion:
+    # Vendor/Distributor
+    vendor: str
+    # Release/Version
+    release: str = ""
+    # Codename for the release
+    codename: str = ""
+    # Package type supported
+    package: str = ""
+    # Update available
+    update: str = ""
+
+    def __str__(self) -> str:
+        return self.vendor
 
 
 class OperatingSystem:
@@ -36,6 +56,7 @@ class OperatingSystem:
         self._node: Node = node
         self._is_posix = is_posix
         self._log = get_logger(name="os", parent=self._node.log)
+        self._os_version: OsVersion = OsVersion("")
 
     @classmethod
     def create(cls, node: Any) -> Any:
@@ -93,12 +114,20 @@ class OperatingSystem:
     def is_posix(self) -> bool:
         return self._is_posix
 
+    @property
+    def os_version(self) -> OsVersion:
+        if not self._os_version:
+            self._os_version = self._get_os_version()
+
+        return self._os_version
+
     @classmethod
     def _get_detect_string(cls, node: Any) -> Iterable[str]:
         typed_node: Node = node
         cmd_result = typed_node.execute(cmd="lsb_release -d", no_error_log=True)
         yield get_matched_str(cmd_result.stdout, cls.__lsb_release_pattern)
 
+        # It covers distros like ClearLinux too
         cmd_result = typed_node.execute(cmd="cat /etc/os-release", no_error_log=True)
         yield get_matched_str(cmd_result.stdout, cls.__os_release_pattern_name)
         yield get_matched_str(cmd_result.stdout, cls.__os_release_pattern_id)
@@ -131,13 +160,42 @@ class OperatingSystem:
         cmd_result = typed_node.execute(cmd="cat /etc/SuSE-release", no_error_log=True)
         yield get_matched_str(cmd_result.stdout, cls.__suse_release_pattern)
 
+    def _get_os_version(self) -> OsVersion:
+        raise NotImplementedError
+
 
 class Windows(OperatingSystem):
     def __init__(self, node: Any) -> None:
         super().__init__(node, is_posix=False)
 
+    def _get_os_version(self) -> OsVersion:
+        self._os_version.vendor = "Microsoft Corporation"
+        cmd_result = self._node.execute(
+            cmd='systeminfo | findstr /B /C:"OS Version"',
+            no_error_log=True,
+        )
+        if cmd_result.exit_code == 0 and cmd_result.stdout != "":
+            for row in cmd_result.stdout.split("\n"):
+                if ": " in row:
+                    key, value = row.split(": ")
+                    if "OS Version" in key:
+                        self._os_version.release = value.strip()
+        return self._os_version
+
 
 class Posix(OperatingSystem, BaseClassMixin):
+
+    __url_pattern = re.compile(
+        r"^(?:http|ftp)s?://"  # http:// or https://
+        r"(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)"
+        r"+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|"
+        r"localhost|"  # localhost...
+        r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"  # ...or ip
+        r"(?::\d+)?"  # optional port
+        r"(?:/?|[/?]\S+)$",
+        re.IGNORECASE,
+    )
+
     def __init__(self, node: Any) -> None:
         super().__init__(node, is_posix=True)
         self._first_time_installation: bool = True
@@ -150,16 +208,68 @@ class Posix(OperatingSystem, BaseClassMixin):
     def name_pattern(cls) -> Pattern[str]:
         return re.compile(f"^{cls.type_name()}$")
 
-    def _install_packages(self, packages: Union[List[str]]) -> None:
+    def _install_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> None:
+        raise NotImplementedError()
+
+    def _query_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> ExecutableResult:
         raise NotImplementedError()
 
     def _initialize_package_installation(self) -> None:
         # sub os can override it, but it's optional
         pass
 
-    def install_packages(
-        self, packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]]
+    def install_package_from_url(
+        self,
+        packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]],
+        signed: bool = True,
     ) -> None:
+        pass
+
+    def install_packages(
+        self,
+        packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]],
+        signed: bool = True,
+    ) -> None:
+        package_names: List[str] = []
+        if not isinstance(packages, list):
+            packages = [packages]
+
+        assert isinstance(packages, list), f"actual:{type(packages)}"
+        for item in packages:
+            if isinstance(item, str):
+                # if item is a URL, download the package first
+                # and then append the downloaded file to package_names.
+                if re.match(self.__url_pattern, item) is not None:
+                    wget_tool = self._node.tools[Wget]
+                    wget_tool.install()
+                    # download the package at the working path.
+                    pkg = wget_tool.get(item, str(self._node.working_path))
+                    package_names.append(pkg)
+                else:
+                    package_names.append(item)
+            elif isinstance(item, Tool):
+                package_names.append(item.package_name)
+            else:
+                assert isinstance(item, type), f"actual:{type(item)}"
+                # Create a temp object, it doesn't trigger install.
+                # So they can be installed together.
+                tool = item.create(self._node)
+                package_names.append(tool.package_name)
+        if self._first_time_installation:
+            self._first_time_installation = False
+            self._initialize_package_installation()
+
+        self._install_packages(package_names, signed)
+
+    # query_packages
+    # Return Value - ExecutableResult
+    def query_packages(
+        self, packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]]
+    ) -> ExecutableResult:
         package_names: List[str] = []
         if not isinstance(packages, list):
             packages = [packages]
@@ -172,14 +282,35 @@ class Posix(OperatingSystem, BaseClassMixin):
                 package_names.append(item.package_name)
             else:
                 assert isinstance(item, type), f"actual:{type(item)}"
-                # Create a temp object, it doesn't trigger install.
-                # So they can be installed together.
+                # Create a temp object, it doesn't query.
+                # So they can be queried together.
                 tool = item.create(self._node)
                 package_names.append(tool.package_name)
-        if self._first_time_installation:
-            self._first_time_installation = False
-            self._initialize_package_installation()
-        self._install_packages(package_names)
+
+        return self._query_packages(package_names)
+
+    # TODO: Implement update_packages
+    def update_packages(
+        self, packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]]
+    ) -> None:
+        pass
+
+    def _get_os_version(self) -> OsVersion:
+        cmd_result = self._node.execute(cmd="cat /etc/os-release", no_error_log=True)
+        if cmd_result.exit_code == 0 and cmd_result.stdout != "":
+            for row in cmd_result.stdout.split("\n"):
+                if "=" in row:
+                    key, value = row.split("=")
+                    if "NAME" in key.upper():
+                        self._os_version.vendor = value.strip()
+                    elif "VERSION_ID" in key.upper():
+                        self._os_version.release = value.strip()
+                    elif "VERSION" in key.upper():
+                        check_codename = re.search(r"\(([^)]+)", value.strip())
+                        if check_codename is not None:
+                            self._os_version.codename = check_codename.group(1)
+
+        return self._os_version
 
 
 class BSD(Posix):
@@ -198,18 +329,57 @@ class Debian(Linux):
     def _initialize_package_installation(self) -> None:
         self._node.execute("apt-get update", sudo=True)
 
-    def _install_packages(self, packages: Union[List[str]]) -> None:
+    def _install_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> None:
         command = (
             f"DEBIAN_FRONTEND=noninteractive "
             f"apt-get -y install {' '.join(packages)}"
         )
-        self._node.execute(command, sudo=True)
+        if not signed:
+            command = command.__add__(" --allow-unauthenticated")
+
+        install_result = self._node.execute(command, sudo=True)
+        if install_result.exit_code != 0:
+            raise LisaException(
+                f"Failed to install {' '.join(packages)}."
+                f" stdout: {install_result.stdout}"
+            )
+
+    def _query_package(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> ExecutableResult:
+        command = f"apt list --installed | grep -Ei {'|'.join(packages)}"
+
+        return self._node.execute(command, sudo=True)
+
+    def _get_os_version(self) -> OsVersion:
+        cmd_result = self._node.execute(cmd="lsb_release -as", no_error_log=True)
+        if cmd_result.exit_code == 0 and cmd_result.stdout != "":
+            for row in cmd_result.stdout.split("\n"):
+                if ": " in row:
+                    key, value = row.split(": ")
+                if "Distributor ID" in key:
+                    self._os_version.vendor = value.strip()
+                elif "Release" in key:
+                    self._os_version.release = value.strip()
+                elif "Codename" in key:
+                    self._os_version.codename = value.strip()
+
+            if self._os_version.vendor in ["Debian", "Ubuntu", "LinuxMint"]:
+                self._os_version.package = "deb"
+
+        return self._os_version
 
 
 class Ubuntu(Debian):
     @classmethod
     def name_pattern(cls) -> Pattern[str]:
         return re.compile("^Ubuntu|ubuntu$")
+
+    def _get_os_version(self) -> OsVersion:
+        self._os_version.vendor = "Ubuntu"
+        return self._os_version
 
 
 class FreeBSD(BSD):
@@ -225,11 +395,51 @@ class Fedora(Linux):
     def name_pattern(cls) -> Pattern[str]:
         return re.compile("^Fedora|fedora$")
 
-    def _install_packages(self, packages: Union[List[str]]) -> None:
-        self._node.execute(
-            f"dnf install -y {' '.join(packages)}",
-            sudo=True,
+    def _install_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> None:
+        command = f"dnf install -y {' '.join(packages)}"
+        if not signed:
+            command.__add__(" --nogpgcheck")
+
+        install_result = self._node.execute(command, sudo=True)
+        if install_result.exit_code != 0:
+            raise LisaException(
+                f"Failed to install {' '.join(packages)}."
+                f" stdout: {install_result.stdout}"
+            )
+        else:
+            self._log.info(
+                f"{' '.join(packages)} is/are installed successfully."
+                f" stdout: {install_result.stdout}"
+            )
+
+    def _query_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> ExecutableResult:
+        command = f"dnf list installed | grep -Ei {'|'.join(packages)}"
+
+        return self._node.execute(command, sudo=True)
+
+    def _get_os_version(self) -> OsVersion:
+        cmd_result = self._node.execute(
+            cmd="cat /etc/fedora-release", no_error_log=True
         )
+        if cmd_result.exit_code == 0 and cmd_result.stdout != "":
+            result = cmd_result.stdout
+            for vendor in ["Fedora", "CentOS", "Red Hat", "XenServer"]:
+                if vendor in result:
+                    self._os_version.vendor = vendor
+                    if re.search(r"\brelease\b", result, re.IGNORECASE):
+                        self._os_version.release = re.split(
+                            "release", result, flags=re.IGNORECASE
+                        )[1].split()[0]
+                    check_code = re.search(r"\(([^)]+)", result)
+                    if check_code is not None:
+                        self._os_version.codename = check_code.group(1)
+                    break
+
+        return self._os_version
 
 
 class Redhat(Fedora):
@@ -261,8 +471,58 @@ class Redhat(Fedora):
                 timeout=3600,
             )
 
-    def _install_packages(self, packages: Union[List[str]]) -> None:
-        self._node.execute(f"yum install -y {' '.join(packages)}", sudo=True)
+    def _install_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> None:
+        command = f"yum install -y {'|'.join(packages)}"
+        if not signed:
+            command.__add__(" --nogpgcheck")
+
+        install_result = self._node.execute(command, sudo=True)
+        # yum returns exit_code=1 if package is already installed.
+        # We do not want to fail if exit_code=1.
+        if install_result.exit_code == 1:
+            self._log.info(
+                f"{' '.join(packages)} is/are already installed."
+                f" stdout: {install_result.stdout}"
+            )
+        elif install_result.exit_code != 0:
+            raise LisaException(
+                f"Failed to install {' '.join(packages)}."
+                f" stdout: {install_result.stdout}"
+            )
+        else:
+            self._log.info(
+                f"{' '.join(packages)} is/are installed successfully."
+                f" stdout: {install_result.stdout}"
+            )
+
+    def _query_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> ExecutableResult:
+        command = f"yum list installed | grep -Ei {' '.join(packages)}"
+
+        return self._node.execute(command, sudo=True)
+
+    def _get_os_version(self) -> OsVersion:
+        cmd_result = self._node.execute(
+            cmd="cat /etc/redhat-release", no_error_log=True
+        )
+        if cmd_result.exit_code == 0 and cmd_result.stdout != "":
+            result = cmd_result.stdout
+            for vendor in ["Red Hat", "CentOS", "Fedora", "XenServer"]:
+                if vendor in result:
+                    self._os_version.vendor = vendor
+                    if re.search(r"\brelease\b", result, re.IGNORECASE):
+                        self._os_version.release = re.split(
+                            "release", result, flags=re.IGNORECASE
+                        )[1].split()[0]
+                    check_codename = re.search(r"\(([^)]+)", result)
+                    if check_codename is not None:
+                        self._os_version.codename = check_codename.group(1)
+                    break
+
+        return self._os_version
 
 
 class CentOs(Redhat):
@@ -289,9 +549,33 @@ class Suse(Linux):
     def _initialize_package_installation(self) -> None:
         self._node.execute("zypper --non-interactive --gpg-auto-import-keys update")
 
-    def _install_packages(self, packages: Union[List[str]]) -> None:
-        command = f"zypper --non-interactive in  {' '.join(packages)}"
-        self._node.execute(command, sudo=True)
+    def _install_packages(
+        self, packages: Union[List[str]], signed: bool = True
+    ) -> None:
+        command = f"zypper --non-interactive in {' '.join(packages)}"
+        if not signed:
+            command.__add__(" --no-gpg-checks")
+        install_result = self._node.execute(command, sudo=True)
+        if install_result.exit_code in (1, 100):
+            raise LisaException(
+                f"Failed to install {' '.join(packages)}."
+                f" stdout: {install_result.stdout}"
+            )
+        elif install_result.exit_code == 0:
+            self._log.info(
+                f"{' '.join(packages)} is/are installed successfully."
+                f" stdout: {install_result.stdout}"
+            )
+        else:
+            self._log.info(
+                f"{' '.join(packages)} is/are installed."
+                " A system reboot or package manager restart might be required."
+                f" stdout: {install_result.stdout}"
+            )
+
+    def _get_os_version(self) -> OsVersion:
+        os_version = OsVersion("SUSE")
+        return os_version
 
 
 class NixOS(Linux):

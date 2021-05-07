@@ -1,10 +1,12 @@
 import pathlib
 import re
-from typing import cast
+from typing import TYPE_CHECKING
 
 from lisa.executable import Tool
-from lisa.operating_system import Posix
 from lisa.util import LisaException
+
+if TYPE_CHECKING:
+    from lisa.operating_system import Posix
 
 
 class Wget(Tool):
@@ -21,12 +23,18 @@ class Wget(Tool):
         return True
 
     def install(self) -> bool:
-        posix_os: Posix = cast(Posix, self.node.os)
-        posix_os.install_packages([self])
+        if not self._check_exists():
+            posix_os: Posix = self.node.os  # type: ignore
+            posix_os.install_packages([self])
         return self._check_exists()
 
     def get(
-        self, url: str, file_path: str = "", filename: str = "", overwrite: bool = True
+        self,
+        url: str,
+        file_path: str = "",
+        filename: str = "",
+        overwrite: bool = True,
+        executable: bool = False,
     ) -> str:
         # create folder when it doesn't exist
         self.node.execute(f"mkdir -p {file_path}", shell=True)
@@ -52,4 +60,7 @@ class Wget(Tool):
         actual_file_path = self.node.execute(f"ls {download_file_path}", shell=True)
         if actual_file_path.exit_code != 0:
             raise LisaException(f"File {actual_file_path} doesn't exist.")
+        if executable:
+            self.node.execute(f"chmod +x {actual_file_path}")
+
         return actual_file_path.stdout

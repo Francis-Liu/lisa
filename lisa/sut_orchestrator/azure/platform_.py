@@ -1187,6 +1187,10 @@ class AzurePlatform(Platform):
             [features.StartStop.name(), features.SerialConsole.name()]
         )
 
+        # update features list if gpu feature is supported
+        if node_space.gpu_count:
+            node_space.features.update(features.Gpu.name())
+
         return node_space
 
     def _get_eligible_vm_sizes(
