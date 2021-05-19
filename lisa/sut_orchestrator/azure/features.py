@@ -8,8 +8,7 @@ import requests
 
 from lisa import features
 from lisa.node import Node
-from lisa.operating_system import CentOs, Redhat, Ubuntu
-from lisa.util import SkippedException
+from lisa.operating_system import CentOs, Redhat, Suse, Ubuntu
 
 from .common import get_compute_client, get_node_context, wait_operation
 
@@ -76,7 +75,8 @@ class Gpu(AzureFeatureMixin, features.Gpu):
         super()._initialize(*args, **kwargs)
         self._initialize_information(self._node)
 
-    def _is_supported(self) -> None:
-        supported_distro = (CentOs, Redhat, Ubuntu)
+    def _is_supported(self) -> bool:
+        supported_distro = (CentOs, Redhat, Ubuntu, Suse)
         if not isinstance(self._node.os, supported_distro):
-            raise SkippedException(f"GPU is not supported with distro {self._node.os}")
+            return False
+        return True

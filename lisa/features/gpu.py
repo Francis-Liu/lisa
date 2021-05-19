@@ -5,10 +5,12 @@ import re
 from enum import Enum
 from typing import Any, cast
 
+from lisa.base_tools.wget import Wget
 from lisa.feature import Feature
 from lisa.operating_system import Linux, Redhat, Ubuntu
 from lisa.tools import Uname
-from lisa.util import LisaException
+from lisa.util import LisaException, SkippedException
+from lisa.util.logger import get_logger
 
 FEATURE_NAME_GPU = "Gpu"
 
@@ -31,51 +33,68 @@ GRID_DRIVER = "https://go.microsoft.com/fwlink/?linkid=874272"
 class Gpu(Feature):
     def __init__(self, node: Any, platform: Any) -> None:
         super().__init__(node, platform)
-        self._log = self._node.log
+        self._log = get_logger("gpu", self.name(), self._node.log)
 
     @classmethod
     def name(cls) -> str:
         return FEATURE_NAME_GPU
 
+    def _is_supported(self) -> bool:
+        raise NotImplementedError()
+
     # download and install NVIDIA grid driver
     def _install_grid_driver(self, version: str) -> None:
-        self._log.info("Starting GRID driver installation")
+        self._log.debug("Starting GRID driver installation")
         if not version.strip():
             version = GRID_DRIVER
 
-        # grid_filename = "NVIDIA-Linux-x86_64-grid.run"
-
         # download and install the NVIDIA GRID driver
+        wget_tool = self._node.tools[Wget]
+        grid_file_path = wget_tool.get(
+            f"{GRID_DRIVER}",
+            str(self._node.working_path),
+            "NVIDIA-Linux-x86_64-grid.run",
+            executable=True,
+        )
+        result = self._node.execute(
+            f"{grid_file_path} --no-nouveau-check --silent --no-cc-version-check"
+        )
+        if result.exit_code != 0:
+            raise LisaException(
+                "Failed to install the GRID driver! " f"stdout: {result.stderr}"
+            )
+        else:
+            self._log.debug("Successfully installed the GRID driver")
 
     # download and install CUDA Driver
     def _install_cuda_driver(self, version: str) -> None:
-        self._log.info("Starting CUDA driver installation")
+        self._log.debug("Starting CUDA driver installation")
         cuda_repo = ""
         linux_os: Linux = cast(Linux, self._node.os)
 
         if not version.strip():
             version = "10.1.105-1"
 
+        os_version = self._node.os.os_version
+
         # CUDA driver installation for redhat distros
         if isinstance(self._node.os, Redhat):
-            cuda_repo_pkg = f"cuda-repo-rhel7-{version}.x86_64.rpm"
+            release = os_version.release.split(".")[0]
+            cuda_repo_pkg = f"cuda-repo-rhel{release}-{version}.x86_64.rpm"
             cuda_repo = (
                 "http://developer.download.nvidia.com/"
-                f"compute/cuda/repos/rhel7/x86_64/{cuda_repo_pkg}"
+                f"compute/cuda/repos/rhel{release}/x86_64/{cuda_repo_pkg}"
             )
-            linux_os = Redhat(self._node)
-
+            linux_os = Redhat(self._node.os)
         # CUDA driver installation for Ubuntu distros
         elif isinstance(self._node.os, Ubuntu):
-            release_version = self._node.os._os_version.release
-            release = re.sub("[^0-9]+", "", release_version)
+            release = re.sub("[^0-9]+", "", os_version.release)
             cuda_repo_pkg = f"cuda-repo-ubuntu{release}_{version}_amd64.deb"
             cuda_repo = (
                 "http://developer.download.nvidia.com/compute/"
                 f"cuda/repos/ubuntu{release}/x86_64/{cuda_repo_pkg}"
             )
-            linux_os = Ubuntu(self._node)
-
+            linux_os = Ubuntu(self._node.os)
         else:
             raise LisaException(
                 f"Distro {self._node.os.__class__.__name__}"
@@ -83,9 +102,9 @@ class Gpu(Feature):
             )
 
         # download and install the cuda driver package from the repo
-        linux_os.install_packages(f"{cuda_repo}", signed=False)
+        linux_os._install_package_from_url(f"{cuda_repo}", signed=False)
 
-    def install_gpu_dep(self) -> None:
+    def _install_gpu_dep(self) -> None:
         uname_tool = self._node.tools[Uname]
         uname_ver = uname_tool.get_linux_information().uname_version
 
@@ -94,17 +113,14 @@ class Gpu(Feature):
             # install the kernel-devel and kernel-header packages
             package_name = f"kernel-devel-{uname_ver} kernel-headers-{uname_ver}"
             self._node.os.install_packages(package_name)
-
             # mesa-libEGL install/update is require to avoid a conflict between
             # libraries - bugzilla.redhat 1584740
             package_name = "mesa-libGL mesa-libEGL libglvnd-devel"
             self._node.os.install_packages(package_name)
-
             # install dkms
             package_name = "dkms"
             self._node.os.install_packages(package_name, signed=False)
-
-        # install dependency libraraies for Ubuntu
+        # install dependency libraries for Ubuntu
         elif isinstance(self._node.os, Ubuntu):
             package_name = (
                 f"build-essential libelf-dev linux-tools-{uname_ver}"
@@ -112,10 +128,24 @@ class Gpu(Feature):
             )
             self._node.os.install_packages(package_name)
 
-    def install_compute_sdk(self, driver: ComputeSDK, version: str = "") -> None:
+    def check_support(self) -> None:
+        # TODO: more supportability can be defined here
+        if not self._is_supported:
+            raise SkippedException(f"GPU is not supported with distro {self._node.os}")
+
+    def install_compute_sdk(
+        self, driver: ComputeSDK = ComputeSDK.CUDA, version: str = ""
+    ) -> None:
+        # install GPU dependencies before installing driver
+        self._install_gpu_dep()
+
+        # install the driver
         if driver == ComputeSDK.GRID:
             self._install_grid_driver(version)
         elif driver == ComputeSDK.CUDA:
             self._install_cuda_driver(version)
         else:
-            raise LisaException("No valid driver SDK name provided to install.")
+            raise LisaException(
+                f"{ComputeSDK} is invalid."
+                "No valid driver SDK name provided to install."
+            )

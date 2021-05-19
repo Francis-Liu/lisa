@@ -17,8 +17,6 @@ from .ntttcp import Ntttcp
 from .reboot import Reboot
 from .uname import Uname
 from .uptime import Uptime
-
-# from .wget import Wget
 from .who import Who
 
 __all__ = [

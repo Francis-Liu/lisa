@@ -1180,16 +1180,16 @@ class AzurePlatform(Platform):
                 )
             elif name == "GPUs":
                 node_space.gpu_count = int(sku_capability.value)
+                # update features list if gpu feature is supported
+                node_space.features = search_space.SetSpace[str](is_allow_set=True)
+                node_space.features.update(features.Gpu.name())
 
         # all nodes support following features
-        node_space.features = search_space.SetSpace[str](is_allow_set=True)
+        if not node_space.features:
+            node_space.features = search_space.SetSpace[str](is_allow_set=True)
         node_space.features.update(
             [features.StartStop.name(), features.SerialConsole.name()]
         )
-
-        # update features list if gpu feature is supported
-        if node_space.gpu_count:
-            node_space.features.update(features.Gpu.name())
 
         return node_space
 
