@@ -385,7 +385,7 @@ class TestSuiteTestCase(TestCase):
         self.default_env._is_initialized = True
         case_metadata = self.case_results[0].runtime_data.metadata
         case_metadata.requirement = simple_requirement(
-            min_count=2, supported_os=[Posix]
+            min_count=2, supported_os=[Posix], unsupported_os=[]
         )
         for node in self.default_env.nodes.list():
             node.os = Posix(node)
@@ -400,7 +400,7 @@ class TestSuiteTestCase(TestCase):
         self.default_env._is_initialized = True
         case_metadata = self.case_results[0].runtime_data.metadata
         case_metadata.requirement = simple_requirement(
-            min_count=2, supported_os=[Posix]
+            min_count=2, supported_os=[Posix], unsupported_os=[]
         )
         for node in self.default_env.nodes.list():
             node.os = Windows(node)
