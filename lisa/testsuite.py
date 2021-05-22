@@ -219,9 +219,8 @@ def simple_requirement(
     platform_types = search_space.create_set_space(
         supported_platform_type, unsupported_platform_type, "platform type"
     )
-    if unsupported_os is None:
-        if supported_os is None or Windows not in supported_os:
-            unsupported_os = [Windows]
+    if unsupported_os is None and supported_os is None:
+        unsupported_os = [Windows]
     os = search_space.create_set_space(supported_os, unsupported_os, "operating system")
 
     return TestCaseRequirement(
